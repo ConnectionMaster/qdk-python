@@ -6,138 +6,234 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 ##
-
-## IMPORTS ##
-
+from azure.quantum.optimization.solvers import Solver
 import unittest
-import json
-import uuid
+import time
 import os
+import functools
+import pytest
+from datetime import datetime, timedelta
 
-from azure.quantum import Workspace
-from azure.quantum.optimization import Problem
-from azure.quantum.optimization.solvers import SimulatedAnnealing
+from common import QuantumTestBase, ZERO_UID
 from azure.quantum import Job
-from azure_devtools.scenario_tests.base import ReplayableTest
+from azure.quantum.optimization import Problem, Term, ProblemType
+import azure.quantum.optimization as microsoft
+import azure.quantum.optimization.oneqbit as oneqbit
+import azure.quantum.optimization.toshiba as toshiba
 
-from workspace_init import create_workspace, create_workspace_mock_login
-from recording_updater import RecordingUpdater
+SOLVER_TYPES = [
+    functools.partial(microsoft.SimulatedAnnealing, beta_start=0),
+    functools.partial(microsoft.ParallelTempering, sweeps=100),
+    functools.partial(microsoft.Tabu, sweeps=100),
+    functools.partial(microsoft.QuantumMonteCarlo, trotter_number=1),
+    functools.partial(microsoft.PopulationAnnealing, sweeps=200),
+    functools.partial(microsoft.SubstochasticMonteCarlo, step_limit=280),
+    functools.partial(oneqbit.TabuSearch, improvement_cutoff=10),
+    functools.partial(oneqbit.PticmSolver, num_sweeps_per_run=99),
+    functools.partial(oneqbit.PathRelinkingSolver, distance_scale=0.44),
+    functools.partial(toshiba.SimulatedBifurcationMachine, loops=10),
+]
 
-class TestJob(ReplayableTest):
+def get_solver_types():
+    one_qbit_enabled = os.environ.get("AZURE_QUANTUM_1QBIT", "") == "1"
+    toshiba_enabled = os.environ.get("AZURE_QUANTUM_TOSHIBA", "") == "1"
+    
+    solver_types = []
+    for solver_type in SOLVER_TYPES:
+        solver_type_name = f'{solver_type.func.__module__}.{solver_type.func.__qualname__}'
+        
+        if (solver_type_name.startswith("azure.quantum.optimization.solvers.") # Microsoft solvers
+            or (solver_type_name.__contains__("toshiba") and toshiba_enabled)
+            or (solver_type_name.__contains__("oneqbit") and one_qbit_enabled)):
+            solver_types.append(solver_type)
+    return solver_types
+
+"""
+Temporarily disabling generation of parametrized test cases due to 
+compatibility issues with VCR
+
+def pytest_generate_tests(metafunc):
+    if "solver_type" in metafunc.fixturenames:
+        solver_types = get_solver_types()
+        metafunc.parametrize(
+            argnames="solver_type",
+            argvalues=(solver_type \
+                       for solver_type in solver_types) ,
+            ids=(f'{solver_type.func.__module__}.{solver_type.func.__qualname__}' \
+                 for solver_type in solver_types) 
+        )
+"""
+
+class TestJobForSolver:
+    """
+    Wrapper for TestJob as a workaround to use pytest_generate_tests to 
+    dynamically generate test cases for each solver.
+    The base classes of TestJob (QuantumTestBase, ReplayableTest) are not
+    compatible the pytest_generate_tests as they have a constructor parameter.
+    Similar issue here: https://stackoverflow.com/questions/63978287/missing-1-required-positional-argument-error-for-fixture-when-softest-testcase-i
+    """
+
+    @pytest.mark.skip(reason="Temporarily disabling generation of parametrized test cases due to \
+                              compatibility issues with VCR")
+    def test_job_submit(self, solver_type):
+        test_job = TestJob("_test_job_submit")
+        test_job._test_job_submit(solver_type=solver_type)
+
+
+class TestJob(QuantumTestBase):
     """TestJob
 
     Tests the azure.quantum.job module.
-
-    The 'recordings' directory is used to replay network connections.
-    To manully create new recordings, remove the 'recordings' subdirectory and run the tests twice.
-        Once to generate the recordings using valid credentials.
-        A second time to update the recordings with dummy values and validate the updated recordings work.
-
-    Additionally, a temporary 'config.ini' file will be required in the 'azure-quantum' directory for the first run of the tests.
-    Create the 'config.ini' with the following contents using valid values:
-    [azure.quantum]
-    subscription_id=<id>
-    resource_group=<rg>
-    workspace_name=<ws>
-    1qbit_enabled=false
     """
+
+
     mock_create_job_id_name = "create_job_id"
     create_job_id = Job.create_job_id
 
-    def get_dummy_job_id(self):
-        if self.in_recording:
-            # This is live, so return a real job id.
-            return TestJob.create_job_id()
-        # This is a replay, so return the dummy job id that will be in the updated recordings.
-        return RecordingUpdater.dummy_uid
-        
-    def create_workspace(self):
-        if self.in_recording:
-            ws = create_workspace()
-        else:
-            ws = create_workspace_mock_login(
-                subscription_id=RecordingUpdater.dummy_uid,
-                resource_group=RecordingUpdater.dummy_rg,
-                name=RecordingUpdater.dummy_ws)
-        return ws
+    def get_test_job_id(self):
+        return ZERO_UID if self.is_playback \
+               else Job.create_job_id()
 
-    def test_job_refresh(self):
-        ws = self.create_workspace()
+    def test_job_submit_microsoft_simulated_annealing(self):
+        solver_type = functools.partial(microsoft.SimulatedAnnealing, beta_start=0)
+        self._test_job_submit(solver_type)
+        self._test_job_filter(solver_type)
 
-        problem = Problem(name="test")
-        count = 4
+    def test_job_submit_microsoft_parallel_tempering(self):
+        solver_type = functools.partial(microsoft.ParallelTempering, sweeps=100)
+        self._test_job_submit(solver_type)
 
-        for i in range(count):
-            problem.add_term(c=i, indices=[i, i+1])
+    def test_job_submit_microsoft_tabu(self):
+        solver_type = functools.partial(microsoft.Tabu, sweeps=100)
+        self._test_job_submit(solver_type)
 
-        with unittest.mock.patch.object(Job, self.mock_create_job_id_name, return_value=self.get_dummy_job_id()):
-            solver = SimulatedAnnealing(ws)
+    def test_job_submit_microsoft_quantum_monte_carlo(self):
+        solver_type = functools.partial(microsoft.QuantumMonteCarlo, trotter_number=1)
+        self._test_job_submit(solver_type)
+
+    def test_job_submit_microsoft_population_annealing(self):
+        solver_type = functools.partial(microsoft.PopulationAnnealing, sweeps=200)
+        self._test_job_submit(solver_type)
+
+    def test_job_submit_microsoft_substochastic_monte_carlo(self):
+        solver_type = functools.partial(microsoft.SubstochasticMonteCarlo, step_limit=280)
+        self._test_job_submit(solver_type)
+
+    @pytest.mark.skipif(not(os.environ.get("AZURE_QUANTUM_1QBIT", "") == "1"), reason="1Qbit tests not enabled")
+    def test_job_submit_oneqbit_tabu_search(self):
+        solver_type = functools.partial(oneqbit.TabuSearch, improvement_cutoff=10)
+        self._test_job_submit(solver_type)
+
+    @pytest.mark.skipif(not(os.environ.get("AZURE_QUANTUM_1QBIT", "") == "1"), reason="1Qbit tests not enabled")
+    def test_job_submit_oneqbit_pticm_solver(self):
+        solver_type = functools.partial(oneqbit.PticmSolver, num_sweeps_per_run=99)
+        self._test_job_submit(solver_type)
+
+    @pytest.mark.skipif(not(os.environ.get("AZURE_QUANTUM_1QBIT", "") == "1"), reason="1Qbit tests not enabled")
+    def test_job_submit_oneqbit_path_relinking_solver(self):
+        solver_type = functools.partial(oneqbit.PathRelinkingSolver, distance_scale=0.44)
+        self._test_job_submit(solver_type)
+
+    @pytest.mark.skipif(not(os.environ.get("AZURE_QUANTUM_TOSHIBA", "") == "1"), reason="Toshiba tests not enabled")
+    def test_job_submit_toshiba_simulated_bifurcation_machine(self):
+        solver_type = functools.partial(toshiba.SimulatedBifurcationMachine, loops=10)
+        self._test_job_submit(solver_type)
+
+    def _test_job_filter(self, solver_type):
+        workspace = self.create_workspace()
+        solver = solver_type(workspace)
+        problem = self.create_problem(name="Test-Job-Filtering")
+
+        with unittest.mock.patch.object(
+            Job,
+            self.mock_create_job_id_name,
+            return_value=self.get_test_job_id()
+        ):
             job = solver.submit(problem)
-            job.refresh()
 
-    def test_job_has_completed(self):
-        ws = self.create_workspace()
+            self.assertEqual(True, job.matches_filter()) # test no filters
+            self.assertEqual(False, job.matches_filter(name_match="Test1"))
+            self.assertEqual(True, job.matches_filter(name_match="Test-"))
+            self.assertEqual(True, job.matches_filter(name_match="Test.+"))
 
-        problem = Problem(name="test")
-        count = 4
+            self.assertEqual(False, job.matches_filter(created_after=datetime.now()))  
 
-        for i in range(count):
-            problem.add_term(c=i, indices=[i, i+1])
+            before_time = datetime.now() - timedelta(days=100)
+            self.assertEqual(True, job.matches_filter(created_after=before_time))    
 
-        with unittest.mock.patch.object(Job, self.mock_create_job_id_name, return_value=self.get_dummy_job_id()):
-            solver = SimulatedAnnealing(ws)
+    def _test_job_submit(self, solver_type):
+        """Tests the job submission and its lifecycle for a given solver.
+
+        :param solver_type:
+            The class name of the solver, for example "SimulatedAnnealing".
+        """
+
+        workspace = self.create_workspace()
+
+        solver = solver_type(workspace)
+
+        problem_name = f'Test-{type(solver).__name__}-{datetime.now():"%Y%m%d-%H%M%S"}'
+
+        problem = self.create_problem(name=problem_name)
+
+        with unittest.mock.patch.object(
+            Job,
+            self.mock_create_job_id_name,
+            return_value=self.get_test_job_id(),
+        ):
+
             job = solver.submit(problem)
-            self.assertEqual(False, job.has_completed())
-            job.get_results()
-            self.assertEqual(True, job.has_completed())
+            # TODO: also test solver.optimize(problem)
 
-    def test_job_wait_unit_completed(self):
-        ws = self.create_workspace()
+            # TODO: Fix recording such that playback works with repeated calls
+            if not self.is_playback:
+                self.assertEqual(False, job.has_completed())
+                if self.in_recording:
+                    time.sleep(3)
 
-        problem = Problem(name="test")
-        count = 4
+                job.refresh()
 
-        for i in range(count):
-            problem.add_term(c=i, indices=[i, i+1])
+                job.wait_until_completed()
 
-        with unittest.mock.patch.object(Job, self.mock_create_job_id_name, return_value=self.get_dummy_job_id()):
-            solver = SimulatedAnnealing(ws)
-            job = solver.submit(problem)
-            job.wait_until_completed()
-            self.assertEqual(True, job.has_completed())
+                job.get_results()
+                self.assertEqual(True, job.has_completed())
 
-    def test_job_get_results(self):
-        ws = self.create_workspace()
+                job = workspace.get_job(job.id)
+                self.assertEqual(True, job.has_completed())
 
-        problem = Problem(name="test")
-        count = 4
 
-        for i in range(count):
-            problem.add_term(c=i, indices=[i, i+1])
+    def create_problem(
+            self,
+            name: str,
+            init: bool = False,
+            problem_type: ProblemType = ProblemType.pubo,
+        ) -> Problem:
+        """Create optimization problem with some default terms
 
-        with unittest.mock.patch.object(Job, self.mock_create_job_id_name, return_value=self.get_dummy_job_id()):
-            solver = SimulatedAnnealing(ws)
-            job = solver.submit(problem)
-            actual = job.get_results()
+        :param init: Set initial configuration
+        :type init: bool
+        :return: Optimization problem
+        :rtype: Problem
+        """
+        terms = [
+            Term(w=-3, indices=[1, 0]),
+            Term(w=5, indices=[2, 0]),
+            Term(w=9, indices=[2, 1]),
+            Term(w=2, indices=[3, 0]),
+            Term(w=-4, indices=[3, 1]),
+            Term(w=4, indices=[3, 2]),
+        ]
 
-        expected = {
-            'version': '1.0',
-            'configuration': {'0': 1, '1': 1, '2': -1, '3': 1, '4': -1},
-            'cost': -6.0,
-            'parameters': {'beta_start': 0.2, 'beta_stop': 1.9307236000000003, 'restarts': 360, 'sweeps': 50}}
+        initial_config = {"1": 0, "0": 1, "2": 0, "3": 1} if init \
+                         else None
 
-        self.assertEqual(expected, actual)
-        
-
-def update_recordings_with_dummy_values():
-    """Replace all secrets in the recorded .yaml files with dummy values as defined in RecordingUpdater. This only needs to be run once."""
-    recording_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), "recordings"))
-    recording_glob = "*.yaml"
-    if os.path.exists(recording_directory):    
-        recording_updater = RecordingUpdater(recording_directory, recording_glob)
-        recording_updater.update_recordings_with_dummy_values()
+        return Problem(
+            name=name,
+            terms=terms,
+            init_config=initial_config,
+            problem_type=problem_type,
+        )
 
 
 if __name__ == "__main__":
-    update_recordings_with_dummy_values()
     unittest.main()
